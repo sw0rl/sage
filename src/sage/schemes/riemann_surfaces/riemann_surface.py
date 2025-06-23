@@ -428,6 +428,33 @@ def find_closest_element(item, lst):
     dists = [(item - l).abs() for l in lst]
     return dists.index(min(dists))
 
+def matrix_grp_permutation(G_matrix, algorithm=None, seed=None):
+        from sage.groups.perm_gps.permgroup import PermutationGroup
+        if not G_matrix.is_finite():
+            raise NotImplementedError("group must be finite")
+        if seed is not None:
+            from sage.all import libgap
+            libgap.set_seed(ZZ(seed))
+        iso = G_matrix._libgap_().IsomorphismPermGroup()
+        
+        # Map each matrix generator to its corresponding permutation
+        perm_gens = []
+        for matrix_gen in G_matrix.gens():
+            perm_gen = iso.Image(matrix_gen._libgap_())
+            perm_gens.append(perm_gen)
+        
+        if algorithm == "smaller":
+            smaller_iso = iso.Image().SmallerDegreePermutationRepresentation()
+            print(f"Smaller image: {smaller_iso.Image()}")
+            # Apply the smaller degree representation to our mapped generators
+            smaller_perm_gens = []
+            for perm_gen in perm_gens:
+                smaller_perm_gen = smaller_iso.Image(perm_gen)
+                smaller_perm_gens.append(smaller_perm_gen)
+            perm_gens = smaller_perm_gens
+        
+        return PermutationGroup([p.sage() for p in perm_gens],
+                                canonicalize=False)
 
 def reparameterize_differential_minpoly(minpoly, z0):
     r"""
@@ -2642,49 +2669,32 @@ class RiemannSurface:
         
         A list of non-trivial idempotent matrices
         """
-        def _is_idempotent(R, tolerance=1e-10):
+        def _is_idempotent(R):
             """Check if matrix R satisfies R^2 = R"""
-            try:
-                diff = R * R - R
-                if hasattr(diff, 'norm'):
-                    return diff.norm() < tolerance
-                else:
-                    return all(abs(entry) < tolerance for entry in diff.list())
-            except Exception:
+            diff = R * R - R
+            print(f'Matrix check: {diff}')
+            if diff.is_zero():
+                print(f'Idempotent: {R}')
+                return True
+            else:
                 return False
         
-        def _is_nontrivial_idempotent(R, tolerance=1e-10):
+        def _is_nontrivial_idempotent(R):
             """Check if R is a non-trivial idempotent (not 0 or I)"""
-            if not _is_idempotent(R, tolerance):
+            
+            if not _is_idempotent(R):
                 return False
             
             n = R.nrows()
             
             # Check if R is zero matrix
-            try:
-                if R.norm() < tolerance or R.is_zero():
-                    return False
-                elif all(abs(entry) < tolerance for entry in R.list()):
-                    return False
-            except Exception:
-                pass
+            if R.is_zero():
+                return False
                 
-            # Check if R is identity matrix - be more explicit about this check
-            try:
-                # Check with identity matrix
-                identity_matrix = Matrix.identity(R.base_ring(), n)
-                if R == identity_matrix:
-                    return False
-                    
-                # Check if (R - I) is zero
-                diff = R - identity_matrix
-                if diff.norm() < tolerance or diff.is_zero():
-                    return False
-                elif all(abs(entry) < tolerance for entry in diff.list()):
-                    return False
-                        
-            except Exception:
-                pass
+            # Check if R is identity matrix
+            identity_matrix = Matrix.identity(R.base_ring(), n)
+            if R == identity_matrix:
+                return False
                 
             return True
         
@@ -2758,45 +2768,64 @@ class RiemannSurface:
                 # If all equations are zero, any linear combination worksgs
                 return []
             
-            # Solve the polynomial system
+            # Solve the polynomial system, typically this may be a positive-dimensional variety, hence try-except
             I = P.ideal(equations)
             try:
                 varieties = I.variety()
-   
-            # Typically the exception is that the ideal is not zero-dimensional
-            except Exception:
-                return []
-            
-            # Process solutions to extract idempotents
-            idempotents = []
-            tolerance = 1e-10
-            
-            for sol in varieties:
-                try:
-                    # Extract coefficients from solution
-                    coeffs = []
-                    for i in range(k):
-                        coeff = sol.get(mu_vars[i], 0) 
-                        coeffs.append(coeff)
-                    
-                    # Skip trivial solution (all coefficients zero)
-                    if all(abs(c) < tolerance for c in coeffs):
-                        continue
-                    
-                    # Construct the matrix R
-                    try:
-                        R = sum(coeffs[i] * basis[i] for i in range(k))
-                        
-                        # Verify it's actually an idempotent
-                        if _is_nontrivial_idempotent(R):
-                            idempotents.append(R)
-                            
-                    except Exception:
-                        continue
-                        
-                except Exception:
-                    continue
+            except Exception as e:
+                varieties = []
+                dim_I = I.dimension()
 
+                num_fixed_start = min(dim_I, k)
+
+                tried = 0
+                for num_fixed in range(num_fixed_start, 0, -1):
+                    if varieties:
+                        break
+                    indices = list(range(num_fixed))
+                    import random
+                    max_attempts = min(2 ** num_fixed, 16)
+                    for attempt in range(max_attempts):
+                        # create a random rational vector of length num_fixed
+                        random_vec = [random.randint(-5, 5) for _ in range(num_fixed)]
+                        # build the additional ideal with fixed values
+                        J = I + P.ideal([mu_vars[idx] - random_vec[pos] for pos, idx in enumerate(indices)])
+                        varieties = J.variety()
+                        if varieties:
+                            # Check if any solutions are non-trivial before accepting
+                            non_trivial_found = False
+                            for sol in varieties:
+                                coeffs = [sol.get(mu_vars[i], 0) for i in range(k)]
+                                if not all(c == 0 for c in coeffs):
+                                    # Check if this actually produces a non-trivial idempotent
+                                    R_candidate = sum(coeffs[i] * basis[i] for i in range(k))
+                                    if _is_nontrivial_idempotent(R_candidate):
+                                        non_trivial_found = True
+                                        break
+                    tried += 1
+                    if varieties:
+                        break
+                if not varieties:
+                    return []
+
+            idempotents = []
+            for sol in varieties:
+                # Extract coefficients from solution
+                coeffs = []
+                for i in range(k):
+                    coeff = sol.get(mu_vars[i], 0) 
+                    coeffs.append(coeff)
+                
+                # Skip trivial solution (all coefficients zero)
+                if all(c == 0 for c in coeffs):
+                    continue
+                
+                # Construct the matrix R
+                R = sum(coeffs[i] * basis[i] for i in range(k))
+                
+                # Verify it's actually an idempotent
+                if _is_nontrivial_idempotent(R):
+                    idempotents.append(R)
             return idempotents
             
         def _find_central_idempotents(basis):
@@ -2847,7 +2876,8 @@ class RiemannSurface:
                 return []
             
             # Now find idempotents in the center
-            return _find_idempotents_polynomial(center_basis)
+            cen_idems = _find_idempotents_polynomial(center_basis)
+            return cen_idems
             
         def _find_basic_idempotents(basis):
             """
@@ -2868,31 +2898,25 @@ class RiemannSurface:
             # Basic checks:
             if not basis:
                 return []
-                
             # 1. Check if we have non-trivial idempotents in the basis
             idempotents = []
             for R in basis:
                 if _is_nontrivial_idempotent(R):
                     idempotents.append(R)
-            
             if idempotents:
                 return idempotents
-                
             # 2. Check for involutions
             n = basis[0].nrows()
             I = Matrix.identity(QQ, n)
             
             for R in basis:
-                try:
-                    if (R * R - I).is_zero() and R != I:
-                        e1 = (I + R) / 2
-                        e2 = (I - R) / 2
-                        if _is_nontrivial_idempotent(e1):
-                            idempotents.append(e1)
-                        if _is_nontrivial_idempotent(e2):
-                            idempotents.append(e2)
-                except Exception:
-                    continue
+                if (R * R - I).is_zero() and R != I:
+                    e1 = (I + R) / 2
+                    e2 = (I - R) / 2
+                    if _is_nontrivial_idempotent(e1):
+                        idempotents.append(e1)
+                    if _is_nontrivial_idempotent(e2):
+                        idempotents.append(e2)
                     
             if idempotents:
                 return idempotents
@@ -2901,90 +2925,231 @@ class RiemannSurface:
         
         def _find_idempotents_spectral(basis, trials=5):
             """
-            Find idempotents using spectral projection method.
-            
+            Find idempotents using spectral projection method and descend them to QQ via field-trace.
+
             This method generates random elements in the Q-span of the endomorphism
             basis, computes their minimal polynomials and splitting fields, then
-            constructs idempotent projectors corresponding to distinct eigenvalues.
-            
+            constructs idempotent projectors corresponding to distinct eigenvalues,
+            and finally applies the field-trace (Galois-averaging) to return
+            QQ-idempotents.
+
             INPUT:
-            
             - ``basis`` -- list of matrices forming a basis for the endomorphism ring
             - ``trials`` -- integer (default: 5); number of random elements to try
-            
+
             OUTPUT:
-            
-            A list of non-trivial idempotent matrices found through spectral
-            decomposition of random elements in the Q-span of the basis.
+            A list of non-trivial idempotent matrices in QQ obtained by spectral
+            decomposition and Galois-averaging.
             """
             import random
+            from sage.rings.number_field.number_field import NumberField
+            from sage.matrix.constructor import Matrix
+            from sage.rings.rational_field import QQ
+            from sage.rings.integer_ring import ZZ
+            from sage.rings.qqbar import QQbar
+            from sage.rings.polynomial.polynomial_ring_constructor import PolynomialRing
+            from sage.arith.all import lcm
+            
+            g = self.genus
             k = len(basis)
             if k == 0:
                 return []
-            for _ in range(trials):
-                coeffs = [random.randint(1, 5) for _ in range(k)]
-                X = sum(coeffs[i] * basis[i] for i in range(k))
-                poly = X.minimal_polynomial()
-                
-                L = poly.splitting_field('a')
-                X = X.change_ring(L)
-                # lift polynomial to L[t]
-                PR = PolynomialRing(L, 'poly.variable_name()')
-                fL = PR(poly)
-                roots = fL.roots(multiplicities=True)
+
+            # Standard symplectic form
+            J = Matrix.block([[Matrix.zero(g), -Matrix.identity(g)],
+                              [Matrix.identity(g), Matrix.zero(g)]])
+            
+            idempotents = []
+            for trial in range(trials):
+                # random QQ-linear combination
+                coeffs = [random.randint(-3, 4) for _ in range(k)]
+                Y = sum(coeffs[i] * basis[i] for i in range(k))
+                X = (Y + J*Y.transpose()*J) / 2
+
+                # minimal polynomial over QQ
+                try:
+                    poly = X.minimal_polynomial()
+                except Exception as e:
+                    continue
+
+                # build splitting field L = QQ[t]/(poly)
+                try:
+                    L = NumberField(poly, 'a')
+                    embeddings = L.embeddings(QQbar)
+                    d = L.degree()
+                    # lift X to matrix over L
+                    X_L = X.change_ring(L)
+                    # find roots in QQbar for spectrum
+                    PR = PolynomialRing(L, 't')
+                    roots = PR(poly.change_ring(L)).roots(multiplicities=True)
+                except Exception as e:
+                    continue
 
                 # require simple spectrum
                 if any(m > 1 for (_, m) in roots):
-                    return []
-                
+                    continue
+
                 lambdas = [r for (r, _) in roots]
+                I_L = Matrix.identity(L, X_L.nrows())
 
-                if L:
-                    Ring = L
-                else:
-                    Ring = X.base_ring()
-                
-                n = X.nrows()
-                I = Matrix(Ring, n, n, [Ring(1) if i == j else Ring(0) for i in range(n) for j in range(n)])
-                idempotents = []
-                for l_i in lambdas:
-                    ej = I
-                    for l_j in lambdas:
-                        if l_i == l_j:
+                # compute each spectral projector P over L, then descend via trace
+                for i, lam in enumerate(lambdas):
+                    P = I_L
+                    for lam_j in lambdas:
+                        if lam_j == lam:
                             continue
-                        ej = (ej * (X - l_i * I)) / (l_i - l_j)
-                    if _is_nontrivial_idempotent(ej):
-                        idempotents.append(ej)
-                if idempotents:
-                    return idempotents
-            return []
+                        P = (P * (X_L - lam_j * I_L)) / (lam - lam_j)
 
+                    # field-trace to QQ
+                    P_conjs = [P.map_coefficients(s) for s in embeddings]
+                    E_trace = sum(P_conjs)
+                    E_QQ = (1 / d) * E_trace
+
+                    # coerce small numerical errors to exact QQ by rounding
+                    try:
+                        entries_QQ = [QQ(c) for c in E_QQ.list()]
+                        E_QQ = Matrix(QQ, E_QQ.nrows(), E_QQ.ncols(), entries_QQ)
+                    except (TypeError, ValueError):
+                        entries_QQ = [QQ(c.numerical_approx(prec=self._prec)) for c in E_QQ.list()]
+                        E_QQ = Matrix(QQ, E_QQ.nrows(), E_QQ.ncols(), entries_QQ)
+
+                    # clear denominators to get integral form, then back to QQ
+                    dens = [c.denominator() for c in E_QQ.list()]
+                    D = lcm(dens) if dens else 1
+                    E_int = (D * E_QQ).change_ring(ZZ)
+                    E = E_int / D
+
+                    # test nontrivial idempotent
+                    if _is_nontrivial_idempotent(E):
+                        idempotents.append(E)
+
+            return idempotents
+
+        def _find_idempotents_group():
+            """
+            Attempt to make use of the symplectic automorphism group of the
+            Jacobian.  As a first diagnostic step we compute the *character
+            table* of this group.  The information itself is not yet used to
+            construct idempotents, but having access to it will be invaluable
+            for future representation-theoretic improvements.
+
+            NOTE:  We purposefully swallow (and merely report) any exceptions
+            raised here so that failures in GAP/character-table routines do
+            not abort the overall idempotent search.
+            """
+            # Obtain the (matrix) automorphism group.
+            G_matrix = self.symplectic_automorphism_group()
+            G_perm = matrix_grp_permutation(G_matrix)
+
+            perm_list = list(G_perm)        
+            mat_list  = [Matrix(g) for g in G_matrix]      
+            perm_to_mat = dict(zip(perm_list, mat_list))
+            
+            listE = []
+            result_idempotents = []
+
+            irr_chars = G_perm.irreducible_characters()
+            print(f"irr_chars: {[char(G_perm.identity()) for char in irr_chars]}")
+
+            order = G_perm.order()
+            for char in irr_chars:
+                E = Matrix(mat_list[0].nrows(), mat_list[0].ncols(), 0)
+                coeff = char(G_perm.identity()) / order
+                for g in perm_list:
+                    E = E + (char(g.inverse()) * perm_to_mat[g])
+                E = coeff*E
+                listE.append(E)
+            
+            # ------------------------------------------------------------------
+            # Post-processing: combine complex-conjugate pairs to obtain matrices
+            # with coefficients in the maximal real subfield (often \QQ), and
+            # retain only the non-trivial idempotents.
+            # ------------------------------------------------------------------
+            from sage.rings.rational_field import QQ
+            result_idempotents = []
+            processed = []  # keep track of matrices we already handled
+
+            def _matrix_conjugate(M):
+                """Return entry-wise complex conjugate of matrix M."""
+                try:
+                    return M.conjugate()
+                except AttributeError:
+                    # Fallback for matrix types without .conjugate method
+                    return M.apply_map(lambda x: x.conjugate())
+
+            for E in listE:
+                # Avoid re-processing the same (or conjugate) matrix
+                if any(E == P for P in processed):
+                    continue
+                Ec = _matrix_conjugate(E)
+                if Ec in listE and Ec != E:
+                    # Combine conjugate pair to (hopefully) get a real matrix
+                    E_real = E + Ec
+                    processed.extend([E, Ec])
+                else:
+                    E_real = E
+                    processed.append(E)
+                # If possible, coerce entries to QQ for cleaner arithmetic
+                try:
+                    E_real = E_real.change_ring(QQ)
+                except (TypeError, ValueError):
+                    pass
+                # Keep only genuine non-trivial idempotents
+                if _is_nontrivial_idempotent(E_real):
+                    result_idempotents.append(E_real)
+
+            return result_idempotents
+
+        def _find_idempotents_centre(basis):
+            from sage.rings.rational_field import QQ
+            from sage.categories.algebras import Algebras
+
+            # Algebra spanned by basis is too large?
+            M = basis[0].parent()
+            M_QQ = M.change_ring(QQ)
+            C = Algebras(QQ).Semisimple().FiniteDimensional().WithBasis()
+
+            A = M_QQ.subalgebra(basis, category=C)   # <- now A is an Algebra
+            return A.central_orthogonal_idempotents()
+
+        idempotents = []
         idempotents = _find_basic_idempotents(basis)
         if idempotents:
             return idempotents
 
-        try:
-            idempotents = _find_idempotents_spectral(basis, trials=1)
-            if idempotents:
-                return idempotents
-        except Exception:
-            pass
+        idempotents = _find_idempotents_group()
+        if idempotents:
+            return idempotents
 
-        try:
-            idempotents = _find_idempotents_polynomial(basis)
-            if idempotents:
-                return idempotents
-        except Exception:
-            pass
-                        
-        try:
-            idempotents = _find_central_idempotents(basis)
-            if idempotents:
-                return idempotents
-        except Exception:
-            pass
-            
-        return []
+        idempotents = _find_idempotents_spectral(basis, trials=5)
+        if idempotents:
+            return idempotents
+
+        idempotents = _find_idempotents_polynomial(basis)
+        if idempotents:
+            return idempotents
+
+        idempotents = _find_central_idempotents(basis)
+        if idempotents:
+            return idempotents
+
+        return idempotents
+
+    def is_reducible(self, search="all"):
+        r"""
+        Check if the Jacobian of the Riemann surface is reducible.
+        """
+        if search == "all":
+            idempotents = self._find_idempotents(self.endomorphism_basis())
+            return len(idempotents) > 0
+        elif search == "centre":
+            idempotents = self._find_central_idempotents(self.endomorphism_basis())
+        elif search == "group":
+            idempotents = self._find_idempotents_group()
+            return len(idempotents) > 0
+        else:
+            raise ValueError("Invalid search method. Must be one of: 'all', 'centre', 'group'")
+        
 
     def _compute_M(self, idempotents):
         r"""
@@ -3018,33 +3183,27 @@ class RiemannSurface:
         if selected_idempotent is None:
             return None
 
-        # Ensure the idempotent is integral by clearing denominators or rounding if necessary
+        # ------------------------------------------------------------------
+        # Step 1: move the idempotent into an integral lattice representation
+        # ------------------------------------------------------------------
         from sage.arith.all import lcm
-        from sage.rings.all import ZZ
+        from sage.rings.all import ZZ, QQ
 
-        # Try to clear denominators if possible
-        entries = selected_idempotent.list()
-        try:
-            # Try to get denominators (for QQ or fraction fields)
-            denoms = []
-            for entry in entries:
-                try:
-                    d = entry.denominator()
-                    if d != 1:
-                        denoms.append(d)
-                except (AttributeError, TypeError):
-                    pass
-            scale = lcm(denoms) if denoms else 1
-            e_integral = Matrix(ZZ, scale * selected_idempotent)
-        except Exception:
-            pass
+        e_integral = selected_idempotent.change_ring(QQ)
+        denoms = [a.denominator() for a in selected_idempotent.list()]
+        scale = lcm(denoms) if denoms else ZZ(1)
+        e_integral = Matrix(ZZ, scale * selected_idempotent)
 
-        # Compute reduction matrix using Hermite normal form
+        # ------------------------------------------------------------------
+        # Step 2: extract an integral basis for the image of the idempotent
+        # ------------------------------------------------------------------
         r = e_integral.rank()
+        if r == 0:
+            return None
+
         M = e_integral.transpose().hermite_form()[:r, :]
         
         return M
-        
 
     def find_M(self):
         r"""
